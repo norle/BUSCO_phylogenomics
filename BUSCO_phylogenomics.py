@@ -13,11 +13,54 @@ import multiprocessing as mp
 from os import listdir, chdir, mkdir, system
 from os.path import abspath, basename, isdir, join
 import sys
-
+import numpy as np
+from numba import jit
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from time import gmtime, strftime
+
+@jit(nopython=True)
+def fill_missing_sequence(seq_len: int, missing_char: str) -> str:
+    return missing_char * seq_len
+
+@jit(nopython=True)
+def calculate_percent_present(species_count: int, total_species: int) -> float:
+    return (species_count / total_species) * 100.0
+
+@jit(nopython=True)
+def check_presence_threshold(count: int, total: int, threshold: float) -> bool:
+    return (count / total * 100) >= threshold
+
+@jit(nopython=True)
+def process_busco_counts(counts, total_species, threshold):
+    """Optimized function to process BUSCO counts."""
+    mask = (counts / total_species * 100) >= threshold
+    return mask
+
+@jit(nopython=True)
+def create_presence_matrix(n_buscos, n_species):
+    """Create an optimized presence/absence matrix."""
+    return np.zeros((n_buscos, n_species), dtype=np.int8)
+
+def process_busco_sequences_parallel(args_tuple):
+    """Process BUSCO sequences in parallel."""
+    sample_name, sample_path, file_ext, is_busco_v3 = args_tuple
+    busco_dict = {}
+    
+    if is_busco_v3:
+        seq_path = join(sample_path, "single_copy_busco_sequences")
+    else:
+        seq_path = join(sample_path, "busco_sequences", "single_copy_busco_sequences")
+    
+    for f in listdir(seq_path):
+        if f.endswith(file_ext):
+            busco_name = f.rstrip(file_ext)
+            record = SeqIO.read(join(seq_path, f), "fasta")
+            busco_dict[busco_name] = SeqRecord(Seq(str(record.seq)), 
+                                             id=sample_name, 
+                                             description="")
+    return sample_name, busco_dict
 
 def main():
     parser = argparse.ArgumentParser(description="Perform phylogenomic reconstruction using BUSCO sequences")
@@ -123,33 +166,41 @@ def main():
     print()
     print_message("Identifying complete and single-copy BUSCO sequences")
 
+    # Prepare data for parallel processing
+    sample_data = [(name, path, sequence_file_extension, args.busco_version_3) 
+                   for name, path in zip(busco_sample_names, busco_samples)]
+    
+    # Process BUSCO sequences in parallel
+    with mp.Pool(processes=threads) as pool:
+        results = pool.map(process_busco_sequences_parallel, sample_data)
+    
+    # Create optimized data structures
     all_buscos = set()
     buscos = {}
-    buscos_per_species = {}
-
-    # Identify single-copy BUSCOs per species
-
-    for busco_sample_name, busco_sample in zip(busco_sample_names, busco_samples):
-        buscos_per_species[busco_sample_name] = []
-
-        if args.busco_version_3:
-            chdir(join(busco_sample, "single_copy_busco_sequences"))
-        else:
-            chdir(join(busco_sample, "busco_sequences", "single_copy_busco_sequences"))
-
-        for f in listdir("."):
-            if f.endswith(sequence_file_extension):
-                busco_name = f.rstrip(sequence_file_extension)
-                all_buscos.add(busco_name)
-                if busco_name not in buscos:
-                    buscos[busco_name] = []
-
-                # TODO This slows things down a bit as it reads all sequences even if they aren't going to be used later
-                record = SeqIO.read(f, "fasta")
-                new_record = SeqRecord(Seq(str(record.seq)), id=busco_sample_name, description="")
-                
-                buscos_per_species[busco_sample_name].append(busco_name)
-                buscos[busco_name].append(new_record)
+    buscos_per_species = {name: [] for name in busco_sample_names}
+    
+    # Process results
+    for sample_name, busco_dict in results:
+        for busco_name, record in busco_dict.items():
+            all_buscos.add(busco_name)
+            if busco_name not in buscos:
+                buscos[busco_name] = []
+            buscos[busco_name].append(record)
+            buscos_per_species[sample_name].append(busco_name)
+    
+    # Create and process presence matrix
+    busco_list = list(all_buscos)
+    presence_matrix = create_presence_matrix(len(busco_list), len(busco_sample_names))
+    
+    for i, busco in enumerate(busco_list):
+        for j, sample in enumerate(busco_sample_names):
+            if busco in buscos_per_species[sample]:
+                presence_matrix[i, j] = 1
+    
+    # Calculate presence counts using optimized function
+    presence_counts = np.sum(presence_matrix, axis=1)
+    qualified_buscos = process_busco_counts(presence_counts, len(busco_sample_names), args.psc)
+    single_copy_buscos = [busco_list[i] for i in range(len(busco_list)) if qualified_buscos[i]]
 
     print("Name\tComplete and single-copy BUSCOs:")
     for busco_sample_name in busco_sample_names:
@@ -174,14 +225,6 @@ def main():
             print_message("Identifying BUSCOs that are complete and single-copy in all species")
         else:
             print_message("Identifying BUSCOs that are complete and single-copy in at least", args.psc, "percent of species")
-
-        single_copy_buscos = []
-
-        for busco in buscos:
-            percent_present = (len(buscos[busco]) / len(busco_sample_names) * 100)
-
-            if percent_present >= args.psc:
-                single_copy_buscos.append(busco)
 
         if len(single_copy_buscos) == 0:
             if args.psc == 100.0:
@@ -257,7 +300,7 @@ def main():
                     partitions.append([alignment.replace(".trimmed.aln", ""), start, start + len(str(record.seq)) - 1])
                     start += len(record.seq)
         else:
-            # we need to handle missing data here
+            # Optimized missing data handling
             for alignment in listdir("."):
                 if alignment.endswith(".trimmed.aln"):
                     check_samples = busco_sample_names[:]
@@ -266,14 +309,15 @@ def main():
                         alignments[str(record.id)] += str(record.seq)
                         check_samples.remove(str(record.id))
 
-                    partitions.append([alignment.replace(".trimmed.aln", ""), start, start + len(str(record.seq)) - 1])
-                    start += len(record.seq)
+                    seq_len = len(str(record.seq))
+                    partitions.append([alignment.replace(".trimmed.aln", ""), start, start + seq_len - 1])
+                    start += seq_len
                     
-                    if len(check_samples) > 0:
-                        # This means some species were missing this busco, fill alignment with missing character ("?" is default)
-                        seq_len = len(str(record.seq))
+                    if check_samples:
+                        # Using numba-optimized function for filling missing sequences
+                        missing_seq = fill_missing_sequence(seq_len, args.missing_character)
                         for sample in check_samples:
-                            alignments[sample] += (args.missing_character * seq_len)
+                            alignments[sample] += missing_seq
         
         chdir(working_directory)
         chdir("supermatrix")
